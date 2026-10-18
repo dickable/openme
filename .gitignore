@@ -2,3 +2,8 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 
+# Do not publish vendor firmware packages or extracted images.
+downloaded-firmware/
+working-copies/
+qemu-work/
+

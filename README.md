@@ -27,3 +27,5 @@ No hardware flashing happens during the initial phase. Work begins with legally 
 
 See [docs/project-scope.md](docs/project-scope.md), [docs/safety-and-recovery.md](docs/safety-and-recovery.md), and the component-specific notes for the current boundaries.
 
+The CSME boot/platform research tree is organized under [csme/README.md](csme/README.md).
+

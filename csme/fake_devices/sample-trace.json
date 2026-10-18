@@ -1,0 +1,131 @@
+{
+  "format": "openme-fake-trace-v0",
+  "trace": [
+    {
+      "client": "",
+      "direction": "host",
+      "event": 1,
+      "message": "RESET",
+      "payload": "",
+      "version": 1
+    },
+    {
+      "direction": "device",
+      "event": 2,
+      "message": "reset",
+      "state": "ready"
+    },
+    {
+      "direction": "device",
+      "event": 3,
+      "message": "RESET",
+      "payload": "",
+      "status": "ok"
+    },
+    {
+      "client": "",
+      "direction": "host",
+      "event": 4,
+      "message": "START",
+      "payload": "",
+      "version": 1
+    },
+    {
+      "direction": "device",
+      "event": 5,
+      "message": "START",
+      "payload": "4f50454e4d452d5452414e53504f52542d31",
+      "status": "ok"
+    },
+    {
+      "client": "",
+      "direction": "host",
+      "event": 6,
+      "message": "ENUMERATE",
+      "payload": "",
+      "version": 1
+    },
+    {
+      "direction": "device",
+      "event": 7,
+      "message": "ENUMERATE",
+      "payload": "6f70656e6d652e636f6e74726f6c006f70656e6d652e6563686f",
+      "status": "ok"
+    },
+    {
+      "client": "openme.echo",
+      "direction": "host",
+      "event": 8,
+      "message": "CONNECT",
+      "payload": "",
+      "version": 1
+    },
+    {
+      "direction": "device",
+      "event": 9,
+      "message": "CONNECT",
+      "payload": "",
+      "status": "ok"
+    },
+    {
+      "client": "openme.echo",
+      "direction": "host",
+      "event": 10,
+      "message": "DATA",
+      "payload": "68656c6c6f2d6f70656e6d65",
+      "version": 1
+    },
+    {
+      "direction": "device",
+      "event": 11,
+      "message": "DATA",
+      "payload": "68656c6c6f2d6f70656e6d65",
+      "status": "ok"
+    },
+    {
+      "client": "openme.echo",
+      "direction": "host",
+      "event": 12,
+      "message": "DISCONNECT",
+      "payload": "",
+      "version": 1
+    },
+    {
+      "direction": "device",
+      "event": 13,
+      "message": "DISCONNECT",
+      "payload": "",
+      "status": "ok"
+    },
+    {
+      "client": "",
+      "direction": "host",
+      "event": 14,
+      "message": "SUSPEND",
+      "payload": "",
+      "version": 1
+    },
+    {
+      "direction": "device",
+      "event": 15,
+      "message": "SUSPEND",
+      "payload": "",
+      "status": "ok"
+    },
+    {
+      "client": "",
+      "direction": "host",
+      "event": 16,
+      "message": "RESUME",
+      "payload": "",
+      "version": 1
+    },
+    {
+      "direction": "device",
+      "event": 17,
+      "message": "RESUME",
+      "payload": "",
+      "status": "ok"
+    }
+  ]
+}

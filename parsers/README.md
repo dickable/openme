@@ -1,4 +1,4 @@
 # Parsers
 
-Planned contents include reproducible tools for inspecting SPI image structure, flash descriptors, region boundaries, ME metadata, and integrity information. Parsers should be read-only by default, deterministic, and tested against synthetic or lawfully shareable fixtures.
+Contents include reproducible tools for inspecting SPI image structure, Intel Flash Descriptor region boundaries, ME partition metadata, and integrity information. `inspect_ifd.py` is a read-only first-pass descriptor inspector for raw SPI images; `inspect_me.py` reports the ME Firmware Partition Table and repeated undocumented MN2 candidate fields without executing or extracting modules; `inspect_cpd.py` inventories the FTPR Code Partition Directory with names, packed offsets, sizes, flags, and hashes only; `inspect_cpd_manifest.py` validates the bounded CPD manifest area and reports raw metadata words without assigning undocumented meanings. None is a replacement for coreboot's `ifdtool`. Parsers should be deterministic and tested against synthetic or lawfully shareable fixtures.
 
