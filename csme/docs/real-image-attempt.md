@@ -45,14 +45,16 @@ Decompression succeeded; no security check was bypassed.
 ```
 
 With the explicit emulator-only gate option, the same real image now reaches
-40 instructions / 106 instruction bytes. The evidence-derived global BSS
+56 instructions / 168 instruction bytes. The evidence-derived global BSS
 window `0x06040000-0x06047004` is writable because the real code initializes
 it, stores the pointer `0x06041288`, and embeds the metadata-sized end address
-`0x06047004`. The next stop is an external fetch at `0x103d`, reached by the
-real call at `0x419bd`; that address is outside the decoded module and is
-treated as a missing ME ROM/library dependency. This is real-byte execution,
-not a synthetic boot and not a claim that Intel authentication was bypassed on
-hardware.
+`0x06047004`. The call at `0x419bd` to the external ROM address `0x103d` is
+identified at ten bounded call sites as the cdecl zero-fill service
+`memset(destination, 0, length)`. The runtime services that ABI at the real
+call boundary without mapping low memory or fabricating ROM instructions. The
+next stop is the distinct external fetch at `0x1005`, reached by the real call
+at `0x417b1`. This is real-byte execution, not a synthetic boot and not a
+claim that Intel authentication was bypassed on hardware.
 
 ## Fault backward slice
 
@@ -105,10 +107,14 @@ The runtime now derives the evidence-backed layout as follows:
 | `0x47000-0x4e004` | meloader-derived process layout | writable loader-layout BSS |
 | `0x06040000-0x06047004` | real rbe literals plus metadata BSS size | evidence-derived writable global/BSS window |
 
-The next blocker is the external call target `0x103d`. The preserved SPI image
-contains no verified reset ROM/library bytes for that address, so mapping or
-stubbing it would fabricate execution rather than advance the real firmware
-trace.
+The `0x103d` dependency is now represented only by an evidence-gated external
+ROM ABI service. The preserved SPI image contains no ROM bytes for it, so the
+trace records the service call and returns to the real caller without adding
+synthetic instructions. The next blocker is `0x1005`: its caller passes a
+pointer to a 12-byte local structure and consumes the first returned word as a
+page count. The SPI image does not contain the ROM implementation or enough
+evidence to determine that word, so it remains a hard stop rather than an
+invented result.
 
 This follows the public loader's text/rodata/guard/stack/heap/BSS ordering and
 its requirement for a ROM/library environment, while preserving the target

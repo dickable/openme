@@ -83,6 +83,10 @@ class RealRuntimeConfig:
     module_bss_size: int = 0
     evidence_global_base: int | None = None
     evidence_global_size: int = 0
+    rom_memset_address: int | None = None
+    rom_service_max_count: int = 0x100000
+    rom_library_base: int = 0x1000
+    rom_library_bytes: bytes | None = None
     pch_base: int = 0x20000000
     pch_size: int = 0x10000
     mei_base: int = 0x20010000
@@ -103,6 +107,7 @@ class RealUnicornRuntime:
         image_sha256: str,
         trace_path: Path,
         config: RealRuntimeConfig | None = None,
+        event_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         if not UNICORN_AVAILABLE:
             raise RealRuntimeStop(
@@ -112,6 +117,7 @@ class RealUnicornRuntime:
         self.image_sha256 = image_sha256
         self.trace_path = Path(trace_path)
         self.config = config or RealRuntimeConfig()
+        self.event_callback = event_callback
         self.instructions = 0
         self.bytes_executed = 0
         self.memory_accesses = 0
@@ -122,12 +128,22 @@ class RealUnicornRuntime:
         self.host = RealImageHostPlatform(image)
         self._code_base = 0
         self._valid_code_end = 0
+        self._rom_base = 0
+        self._rom_end = 0
         self._last_instruction: dict[str, Any] | None = None
+        self._writable_ranges: list[tuple[int, int]] = []
+        self.external_services = 0
 
     def _emit(self, event: dict[str, Any]) -> None:
         if self._trace_file is not None:
             self._trace_file.write(json.dumps(event, sort_keys=True) + "\n")
             self._trace_file.flush()
+        if self.event_callback is not None:
+            try:
+                self.event_callback(event)
+            except Exception:
+                # Live presentation must never change the execution result.
+                pass
 
     def _on_code(self, _uc: Any, address: int, size: int, _user: Any = None) -> None:
         self.instructions += 1
@@ -140,10 +156,13 @@ class RealUnicornRuntime:
             "bytes": instruction_bytes,
             "sequence": self.instructions,
         }
-        if address < self._code_base or address + size > self._valid_code_end:
+        in_module = self._code_base <= address and address + size <= self._valid_code_end
+        in_rom = self._rom_base <= address and address + size <= self._rom_end
+        if not in_module and not in_rom:
             raise RealRuntimeStop(
-                f"instruction fetch outside valid module extent at 0x{address:x} "
-                f"(valid 0x{self._code_base:x}-0x{self._valid_code_end:x})"
+                f"instruction fetch outside valid module extent or mapped ROM at 0x{address:x} "
+                f"(module 0x{self._code_base:x}-0x{self._valid_code_end:x}, "
+                f"rom 0x{self._rom_base:x}-0x{self._rom_end:x})"
             )
         self._emit(
             {
@@ -154,12 +173,14 @@ class RealUnicornRuntime:
                 "bytes": instruction_bytes,
                 "image_sha256": self.image_sha256,
                 "sequence": self.instructions,
+                "region": "module" if in_module else "rom-library",
             }
         )
         if self.instructions >= self.config.max_instructions:
             raise RealRuntimeStop("instruction timeout budget exhausted")
         if time.monotonic() - self._started_at > self.config.timeout_seconds:
             raise RealRuntimeStop("wall-clock timeout")
+        self._try_rom_memset_call(address, size)
 
     def _on_memory(
         self,
@@ -228,6 +249,74 @@ class RealUnicornRuntime:
         )
         raise RealRuntimeStop(f"invalid {kind} at 0x{address:x} size={size} value=0x{value:x}")
 
+    def _try_rom_memset_call(self, address: int, size: int) -> None:
+        """Emulate one image-evidenced external ROM memset call.
+
+        The SPI image contains no ROM bytes.  The rbe code nevertheless makes
+        a bounded set of cdecl calls to 0x103d, all with the observed
+        ``memset(destination, 0, length)`` ABI.  Intercept only the direct
+        call instruction at its real call site; unknown low-memory fetches
+        remain hard stops.
+        """
+
+        if self.config.rom_memset_address is None:
+            return
+        if size != 5:
+            return
+        instruction = bytes(self.uc.mem_read(address, size))
+        if instruction[0] != 0xE8:
+            return
+        displacement = int.from_bytes(instruction[1:], "little", signed=True)
+        target = address + size + displacement
+        if target != self.config.rom_memset_address:
+            return
+        esp = int(self.uc.reg_read(UC_X86_REG_ESP))
+        try:
+            destination, fill, count = (
+                int.from_bytes(self.uc.mem_read(esp + offset, 4), "little")
+                for offset in (0, 4, 8)
+            )
+        except Exception:
+            return
+        if fill != 0 or count > self.config.rom_service_max_count:
+            return
+        if count and destination + count < destination:
+            return
+        if count and not any(
+            destination >= left and destination + count <= right
+            for left, right in self._writable_ranges
+        ):
+            return
+        if not count:
+            destination_end = destination
+        else:
+            destination_end = destination + count
+        try:
+            if count:
+                self.uc.mem_write(destination, bytes(count))
+            self.uc.reg_write(UC_X86_REG_EAX, destination)
+            self.uc.reg_write(UC_X86_REG_EIP, address + size)
+        except Exception:
+            return
+        self.external_services += 1
+        self._emit(
+            {
+                "type": "external-service",
+                "domain": "REAL FIRMWARE INSTRUCTION EXECUTION",
+                "service": "rom_memset",
+                "address": f"0x{address:x}",
+                "abi": "cdecl",
+                "destination": f"0x{destination:x}",
+                "destination_end": f"0x{destination_end:x}",
+                "fill": fill,
+                "count": count,
+                "call_address": f"0x{address:x}",
+                "return_address": f"0x{address + size:x}",
+                "image_sha256": self.image_sha256,
+                "sequence": self.instructions,
+            }
+        )
+
     def run(self, module: LoadedModule, entry_offset: int) -> dict[str, Any]:
         """Execute only the selected real module bytes; never synthesize code."""
 
@@ -244,6 +333,19 @@ class RealUnicornRuntime:
         self._valid_code_end = module.candidate.guest_base + valid_extent
         self.uc.mem_map(code_base, code_end - code_base, UC_PROT_READ | UC_PROT_EXEC)
         self.uc.mem_write(module.candidate.guest_base, module.data)
+        if self.config.rom_library_bytes:
+            rom_base = self.config.rom_library_base
+            rom_end = rom_base + len(self.config.rom_library_bytes)
+            if rom_base < 0 or rom_end > 0x100000000:
+                raise RealRuntimeStop("ROM library mapping exceeds the 32-bit address space")
+            self.uc.mem_map(
+                align_down(rom_base),
+                align_up(rom_end) - align_down(rom_base),
+                UC_PROT_READ | UC_PROT_EXEC,
+            )
+            self.uc.mem_write(rom_base, self.config.rom_library_bytes)
+            self._rom_base = rom_base
+            self._rom_end = rom_end
         spi_size = align_up(len(self.image))
         self.uc.mem_map(self.config.spi_base, spi_size, UC_PROT_READ)
         self.uc.mem_write(self.config.spi_base, self.image)
@@ -253,6 +355,7 @@ class RealUnicornRuntime:
             (self.config.sram_base, self.config.sram_base + self.config.sram_size),
             (self.config.dram_base, self.config.dram_base + self.config.dram_size),
         ]
+        self._writable_ranges = writable_ranges
 
         def map_writable_region(base: int, size: int) -> None:
             if not size:
@@ -306,6 +409,20 @@ class RealUnicornRuntime:
                     if self.config.evidence_global_base is not None
                     else None
                 ),
+                "rom_services": (
+                    {"memset": f"0x{self.config.rom_memset_address:x}"}
+                    if self.config.rom_memset_address is not None
+                    else {}
+                ),
+                "rom_library": (
+                    {
+                        "base": f"0x{self.config.rom_library_base:x}",
+                        "size": f"0x{len(self.config.rom_library_bytes):x}",
+                        "source": "supplied target-generation ROM dump",
+                    }
+                    if self.config.rom_library_bytes
+                    else None
+                ),
             }
         )
         self._started_at = time.monotonic()
@@ -313,7 +430,12 @@ class RealUnicornRuntime:
         self.uc.hook_add(UC_HOOK_MEM_READ | UC_HOOK_MEM_WRITE, self._on_memory)
         self.uc.hook_add(UC_HOOK_MEM_INVALID, self._on_invalid)
         try:
-            self.uc.emu_start(entry, 0, timeout=int(self.config.timeout_seconds * 1_000_000), count=self.config.max_instructions)
+            self.uc.emu_start(
+                entry,
+                0,
+                timeout=int(self.config.timeout_seconds * 1_000_000),
+                count=self.config.max_instructions,
+            )
             self.stop_reason = "emulator returned"
         except RealRuntimeStop as exc:
             self.stop_reason = str(exc)
@@ -327,6 +449,7 @@ class RealUnicornRuntime:
                     "synthetic_model": False,
                     "instructions": self.instructions,
                     "memory_accesses": self.memory_accesses,
+                    "external_services": self.external_services,
                     "stop_reason": self.stop_reason,
                     "registers": self._register_dump(),
                 }
@@ -338,6 +461,7 @@ class RealUnicornRuntime:
             "bytes_executed": self.bytes_executed,
             "instructions_executed": self.instructions,
             "memory_accesses": self.memory_accesses,
+            "external_services": self.external_services,
             "stop_reason": self.stop_reason,
             "trace_path": str(self.trace_path),
             "registers_at_stop": self._register_dump(),

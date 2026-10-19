@@ -187,8 +187,10 @@ static int read_pch(const OpenMEPlatform *platform, uint32_t offset,
         value = (platform->clock_control ? OPENME_ME_CLOCK_ON : 0) |
                 (platform->power_control ? OPENME_ME_POWER_ON : 0) |
                 (!platform->reset_control ? OPENME_ME_RESET_DEASSERTED : 0) |
-                (platform->state >= OPENME_ME_SPI_READY ? OPENME_ME_SPI_ONLINE : 0) |
-                (platform->state >= OPENME_ME_MEI_READY ? OPENME_ME_MEI_ONLINE : 0) |
+                (platform->state >= OPENME_ME_SPI_READY &&
+                 platform->state <= OPENME_ME_RUNNING ? OPENME_ME_SPI_ONLINE : 0) |
+                (platform->state >= OPENME_ME_MEI_READY &&
+                 platform->state <= OPENME_ME_RUNNING ? OPENME_ME_MEI_ONLINE : 0) |
                 (platform->state == OPENME_ME_AUTH_PENDING ? OPENME_ME_AUTH_REQUIRED : 0);
         break;
     case OPENME_ME_SPI_COMMAND:
@@ -271,7 +273,8 @@ int openme_me_platform_read(const OpenMEPlatform *platform,
         return read_pch(platform, address - OPENME_ME_PCH_BASE, buffer, size);
     }
     if (range_contains(OPENME_ME_MEI_BASE, OPENME_ME_MEI_SIZE, address, size)) {
-        value = platform->state >= OPENME_ME_MEI_READY ? 1u : 0u;
+        value = platform->state >= OPENME_ME_MEI_READY &&
+                platform->state <= OPENME_ME_RUNNING ? 1u : 0u;
         scalar_store(buffer, value, size);
         return 0;
     }

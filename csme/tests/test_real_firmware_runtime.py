@@ -1,5 +1,6 @@
 import hashlib
 import json
+import struct
 import unittest
 from pathlib import Path
 
@@ -111,6 +112,69 @@ class RealFirmwareRuntimeTests(unittest.TestCase):
 
         self.assertNotIn("Invalid memory write", result["stop_reason"] or "")
         self.assertTrue(any(event.get("address") == "0x6040000" for event in events if event.get("type") == "memory"))
+
+    def test_evidence_rom_memset_service_returns_to_real_call_site(self):
+        # push 4; push 0; push 0x003fe000; call 0x103d; add esp,12; loop
+        # The call remains a real instruction; only the external ROM ABI is
+        # serviced because its bytes are not part of the SPI image.
+        call_offset = 2 + 2 + 5
+        call_address = 0x40000 + call_offset
+        program = bytearray.fromhex("6a046a006800e03f00")
+        program.extend(b"\xe8" + struct.pack("<i", 0x103D - (call_address + 5)))
+        program.extend(bytes.fromhex("83c40cebfe"))
+        trace = Path("qemu-work") / "traces" / "test-real-runtime-rom-memset.jsonl"
+        trace.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            result = RealUnicornRuntime(
+                image=b"\0",
+                image_sha256="0" * 64,
+                trace_path=trace,
+                config=RealRuntimeConfig(
+                    max_instructions=20,
+                    rom_memset_address=0x103D,
+                ),
+            ).run(_module(bytes(program)), 0)
+            events = [json.loads(line) for line in trace.read_text().splitlines()]
+        finally:
+            trace.unlink(missing_ok=True)
+
+        services = [event for event in events if event.get("type") == "external-service"]
+        self.assertEqual(len(services), 1)
+        self.assertEqual(services[0]["service"], "rom_memset")
+        self.assertEqual(services[0]["destination"], "0x3fe000")
+        self.assertEqual(services[0]["count"], 4)
+        self.assertEqual(result["external_services"], 1)
+        self.assertNotIn("Invalid memory fetch", result["stop_reason"] or "")
+
+    def test_supplied_rom_bytes_execute_as_real_rom_region(self):
+        # call 0x1000; loop.  The supplied byte at 0x1000 is an actual RET,
+        # so the test verifies the real-ROM mapping path without a host stub.
+        call_address = 0x40000
+        program = b"\xe8" + struct.pack("<i", 0x1000 - (call_address + 5)) + b"\xeb\xfe"
+        trace = Path("qemu-work") / "traces" / "test-real-runtime-rom-bytes.jsonl"
+        trace.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            result = RealUnicornRuntime(
+                image=b"\0",
+                image_sha256="0" * 64,
+                trace_path=trace,
+                config=RealRuntimeConfig(
+                    max_instructions=8,
+                    rom_library_bytes=b"\xc3",
+                ),
+            ).run(_module(program), 0)
+            events = [json.loads(line) for line in trace.read_text().splitlines()]
+        finally:
+            trace.unlink(missing_ok=True)
+
+        rom_instructions = [
+            event for event in events
+            if event.get("type") == "instruction" and event.get("region") == "rom-library"
+        ]
+        self.assertEqual(len(rom_instructions), 1)
+        self.assertEqual(rom_instructions[0]["address"], "0x1000")
+        self.assertEqual(rom_instructions[0]["bytes"], "c3")
+        self.assertIn("instruction timeout budget exhausted", result["stop_reason"] or "")
 
 
 if __name__ == "__main__":

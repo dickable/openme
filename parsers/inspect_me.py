@@ -65,17 +65,37 @@ def inspect_me(path: Path) -> dict:
     ifd = inspect_ifd(path)
     me_region = next((region for region in ifd.get("regions", [])
                       if region["name"] == "Intel ME" and region["size"]), None)
+    source = "descriptor"
+    if me_region is None:
+        # An extracted ME region is a valid parser input even though it has no
+        # enclosing Intel Flash Descriptor.  Require the FPT signature in the
+        # same bounded prefix used below before classifying it this way.
+        standalone_fpt_offset = _find_fpt(image)
+        if standalone_fpt_offset is not None:
+            me_region = {
+                "name": "Intel ME (standalone)",
+                "offset": 0,
+                "size": len(image),
+                "end": len(image),
+                "source": "standalone ME region; descriptor absent",
+            }
+            source = "standalone"
     result = {
         "path": str(path),
         "image_size": len(image),
         "sha256": hashlib.sha256(image).hexdigest(),
         "me_region": me_region,
+        "source": source,
         "fpt": None,
         "warnings": list(ifd.get("warnings", [])),
     }
     if me_region is None or me_region["offset"] is None:
         result["warnings"].append("Intel ME region was not identified by the descriptor")
         return result
+    if source == "standalone":
+        result["warnings"].append(
+            "Standalone ME region detected from bounded $FPT signature; no Intel Flash Descriptor present"
+        )
 
     start = me_region["offset"]
     end = start + me_region["size"]

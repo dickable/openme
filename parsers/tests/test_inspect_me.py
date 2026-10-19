@@ -37,6 +37,27 @@ class InspectMeTests(unittest.TestCase):
         self.assertEqual(result["mn2_headers"][0]["candidate_16bit_tuple"], [11, 8, 92, 4222])
         self.assertIn("not asserted", result["version_status"])
 
+    def test_standalone_me_region_is_reported_without_descriptor(self):
+        image = bytearray(0x20000)
+        fpt = 0x10
+        image[fpt:fpt + 4] = b"$FPT"
+        struct.pack_into("<I", image, fpt + 4, 1)
+        image[fpt + 8:fpt + 12] = bytes((0x20, 0x10, 0x20, 0xE0))
+        entry = fpt + 0x20
+        image[entry:entry + 4] = b"FTPR"
+        struct.pack_into("<II", image, entry + 8, 0x1000, 0x100)
+
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
+            path = Path(directory) / "standalone-me.bin"
+            path.write_bytes(image)
+            result = inspect_me(path)
+
+        self.assertEqual(result["source"], "standalone")
+        self.assertEqual(result["me_region"]["offset"], 0)
+        self.assertEqual(result["me_region"]["size"], len(image))
+        self.assertEqual(result["fpt"]["partitions"][0]["absolute_offset"], 0x1000)
+        self.assertTrue(any("Standalone ME region" in warning for warning in result["warnings"]))
+
 
 if __name__ == "__main__":
     unittest.main()

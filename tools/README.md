@@ -1,6 +1,18 @@
 # Tools
 
-This directory contains small, reproducible utilities for parsing, hashing, fixture generation, emulation support, and report generation. Tools must default to read-only behavior and must not contact external services or perform firmware flashing.
+This directory contains utilities for parsing, hashing, firmware builds, QEMU
+tests, and physical flashing. Image-analysis tools keep their stated access
+policies. Hardware operations are separate, explicit commands in
+`flash_openme.py`; the normal build and QEMU launcher do not access hardware.
+
+- `build_openme.py`: build the new C firmware under `src/` and record its hash,
+  entry, load bounds, source hashes, compiler commands, map, and disassembly.
+- `run_openme_qemu.py`: interact with compiled firmware in QEMU; save a serial
+  transcript, translation/TB-dispatch trace, and JSON test result.
+- `launch-openme.ps1`: open a visible PowerShell window, build, and run the QEMU
+  shell; add `-InPlace` to use the current terminal or `-Test` for automated tests.
+- `flash_openme.py`: independent chip backups, offline image comparison, and
+  explicitly confirmed flashrom write/verify/readback. See `hardware/README.md`.
 
 `inspect_iso.py` reads ISO9660 metadata and root-directory names without mounting, extracting, executing, or modifying the image.
 
@@ -45,6 +57,15 @@ checks that the model produces the same deterministic events. Both operate on
 JSON and have no hardware or network behavior.
 
 The project also tracks [spispy](https://github.com/osresearch/spispy) as a future hardware/emulation reference. It is an FPGA-based SPI flash emulator and monitor, not a parser for Intel ME firmware images; its documented limitations and voltage requirements must be reviewed before any hardware use.
+
+## Source-firmware cold persistence
+
+`python tools/run_persist.py` builds the `--persist` profile and runs two separate
+QEMU processes sharing a host NOR snapshot. It checks counter 1 → 2, snapshot
+CRCs, persisted records, process exit, and execution evidence. Each run retains
+its artifacts in a new `qemu-work/openme-persist/run-*` directory. It uses only a
+loopback COM2 test channel; no physical chip is touched. See
+[cold-persistence.md](../docs/cold-persistence.md). This is not a pflash driver.
 
 ## Visible real-image attempt
 

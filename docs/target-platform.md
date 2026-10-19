@@ -1,6 +1,13 @@
-# Locked research target
+# Skylake research reference (historical — not the active target)
 
-OpenME's first hardware-specific target is one Lenovo ThinkPad T460, machine type **20FM**, with the following reference profile:
+> **Superseded.** The active hardware target is now the pre-CSME-11, ARC-core ME
+> (generation 6 and earlier); see [me6-target.md](me6-target.md). Skylake/CSME 11
+> is locked against owner firmware (fused-key root of trust) and is kept here only
+> as reference research. The content below describes that earlier reference.
+
+The former project target was the Skylake family; a physical board was never
+selected. The preserved-image research uses a Lenovo ThinkPad T460-class
+reference. The earlier proposed machine type **20FM** has this reference profile:
 
 - CPU: Intel Core i5-6200U, Skylake-U.
 - Graphics: integrated Intel HD Graphics 520; no discrete GPU.

@@ -24,6 +24,12 @@ def main(argv: list[str] | None = None) -> int:
         help="explicitly bypass only the local emulator admission gate; never affects hardware",
     )
     parser.add_argument("--huffman-dictionary", type=Path, default=None)
+    parser.add_argument(
+        "--rom-library",
+        type=Path,
+        default=None,
+        help="optional target-generation ROM dump mapped at meloader base 0x1000",
+    )
     args = parser.parse_args(argv)
     print(
         json.dumps(
@@ -32,6 +38,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.trace,
                 allow_emulation_auth_bypass=args.allow_emulation_auth_bypass,
                 huffman_dictionary_path=args.huffman_dictionary,
+                rom_library_path=args.rom_library,
             ).run(),
             indent=2,
             sort_keys=True,

@@ -16,7 +16,7 @@ from dataclasses import replace
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 try:
     from parsers.inspect_cpd import inspect_cpd
@@ -202,11 +202,13 @@ def _module_runtime_layout(entry: dict[str, Any], metadata: dict[str, Any]) -> d
 def _evidence_global_layout(module: bytes, entry: dict[str, Any]) -> dict[str, int | str] | None:
     """Derive the rbe global/BSS window only from mutually reinforcing bytes.
 
-    The target code writes a pointer to 0x06040000, later dereferences the
-    pointer at 0x06041288, and embeds 0x06047004 as the end address.  The
-    latter span is exactly the metadata BSS size.  This is a bounded evidence
-    correlation, not a general-purpose address guess; absent all three facts,
-    no extra region is mapped.
+    The target code contains a small startup copy loop which loads a bounded
+    source word from the decoded module and stores it at an external global
+    base.  Derive the source address and pointer from that loop instead of
+    assuming one ME11 image's offsets.  The destination span must also match
+    the process BSS size from metadata and the decoded module must contain its
+    end literal.  This is a bounded evidence correlation, not a general-
+    purpose address guess; absent all facts, no extra region is mapped.
     """
 
     if str(entry.get("module")) != "rbe":
@@ -214,23 +216,121 @@ def _evidence_global_layout(module: bytes, entry: dict[str, Any]) -> dict[str, i
     code_size = int(entry.get("code_size", 0))
     if code_size <= 0 or len(module) < 0x3004:
         return None
-    base = 0x06040000
-    pointer = base + 0x1288
+    code_base = entry.get("code_base", 0)
+    if isinstance(code_base, str):
+        code_base = int(code_base, 0)
+    code_base = int(code_base)
     runtime_layout = entry.get("runtime_layout") or {}
     bss_size = int(entry.get("bss_size", runtime_layout.get("bss_size", 0)))
-    end = base + bss_size
-    if bss_size <= 0 or struct.pack("<I", pointer) != module[0x3000:0x3004]:
+    if bss_size <= 0:
         return None
-    if module.find(struct.pack("<I", base)) < 0:
-        return None
-    if module.find(struct.pack("<I", end)) < 0:
+    code_end = min(code_size, len(module))
+    store_pattern = b"\x89\x48\xfc"
+    load_pattern = b"\x8b\x4a\xfc"
+    for store_offset in range(3, max(3, code_end - len(store_pattern) + 1)):
+        if module[store_offset:store_offset + 3] != store_pattern:
+            continue
+        load_offset = store_offset - len(load_pattern)
+        if module[load_offset:store_offset] != load_pattern:
+            continue
+        window_start = max(0, load_offset - 0x40)
+        for mov_base in range(window_start, load_offset):
+            if module[mov_base] != 0xB8 or mov_base + 5 > load_offset:
+                continue
+            base = struct.unpack_from("<I", module, mov_base + 1)[0]
+            if not 0x06000000 <= base < 0x07000000:
+                continue
+            end = base + bss_size
+            cmp_found = any(
+                module[offset] == 0x3D
+                and struct.unpack_from("<I", module, offset + 1)[0] == base + 4
+                for offset in range(mov_base + 5, load_offset)
+                if offset + 5 <= load_offset
+            )
+            if not cmp_found:
+                continue
+            for mov_source in range(mov_base + 5, load_offset):
+                if module[mov_source] != 0xBA or mov_source + 5 > load_offset:
+                    continue
+                source_end = struct.unpack_from("<I", module, mov_source + 1)[0]
+                source_offset = source_end - code_base
+                if source_offset < code_end or source_offset + 4 > len(module):
+                    continue
+                pointer = struct.unpack_from("<I", module, source_offset)[0]
+                if pointer < base or pointer + 4 > end:
+                    continue
+                if module.find(struct.pack("<I", end)) < 0:
+                    continue
+                return {
+                    "base": base,
+                    "size": bss_size,
+                    "pointer": pointer,
+                    "end": end,
+                    "source_address": source_end,
+                    "source_offset": source_offset,
+                    "source": "rbe startup copy loop plus metadata BSS-size correlation",
+                }
+    return None
+
+
+def _rom_memset_evidence(module: bytes, *, code_base: int, valid_extent: int) -> dict[str, Any] | None:
+    """Identify the one external ROM service supported by observed call sites.
+
+    ``0x103d`` is outside every bounded SPI-backed module.  In the decoded
+    rbe code, its direct callers consistently prepare the cdecl
+    ``memset(destination, 0, length)`` argument shape.  This detector admits
+    only that exact target after checking the call sites stay within the valid
+    code extent; it does not turn an arbitrary low address into executable
+    memory.
+    """
+
+    target = 0x103D
+    call_sites: list[dict[str, Any]] = []
+    end = min(valid_extent, len(module))
+    for offset in range(max(0, end - 4)):
+        if module[offset] != 0xE8:
+            continue
+        displacement = struct.unpack_from("<i", module, offset + 1)[0]
+        address = code_base + offset
+        if address + 5 + displacement != target:
+            continue
+        prefix = module[max(0, offset - 24):offset]
+        zero_argument = prefix.rfind(b"\x6a\x00")
+        if zero_argument < 0:
+            continue
+        before_zero = prefix[:zero_argument]
+        destination_argument = bool(
+            before_zero
+            and (
+                any(0x50 <= byte <= 0x57 for byte in before_zero)
+                or 0x6A in before_zero
+                or 0x68 in before_zero
+                or b"\xC7\x04\x24" in before_zero
+                or 0xFF in before_zero
+            )
+        )
+        if not destination_argument:
+            continue
+        call_sites.append(
+            {
+                "address": f"0x{address:x}",
+                "offset": f"0x{offset:x}",
+                "target": f"0x{target:x}",
+                "argument_shape": "cdecl memset(destination, 0, length)",
+            }
+        )
+    if not call_sites:
         return None
     return {
-        "base": base,
-        "size": bss_size,
-        "pointer": pointer,
-        "end": end,
-        "source": "rbe pointer-table initialization plus metadata BSS-size correlation",
+        "status": "verified-by-call-site-shape",
+        "address": target,
+        "name": "memset",
+        "abi": "cdecl",
+        "call_sites": call_sites,
+        "conclusion": (
+            "the bounded rbe bytes make direct zero-fill calls to the external "
+            "ROM service at 0x103d; only this service is emulated"
+        ),
     }
 
 
@@ -244,10 +344,14 @@ class RealMEImageAttempt:
         *,
         allow_emulation_auth_bypass: bool = False,
         huffman_dictionary_path: Path | None = None,
+        rom_library_path: Path | None = None,
+        event_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self.image_path = Path(image_path)
         self.trace_path = Path(trace_path) if trace_path is not None else None
         self.allow_emulation_auth_bypass = allow_emulation_auth_bypass
+        self.rom_library_path = Path(rom_library_path) if rom_library_path is not None else None
+        self.event_callback = event_callback
         self.huffman_dictionary_path = (
             Path(huffman_dictionary_path)
             if huffman_dictionary_path is not None
@@ -259,11 +363,16 @@ class RealMEImageAttempt:
         )
 
     def _trace(self, event: dict[str, Any]) -> None:
-        if self.trace_path is None:
-            return
-        self.trace_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.trace_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(event, sort_keys=True) + "\n")
+        if self.trace_path is not None:
+            self.trace_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.trace_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(event, sort_keys=True) + "\n")
+        if self.event_callback is not None:
+            try:
+                self.event_callback(event)
+            except Exception:
+                # Presentation is intentionally isolated from the execution path.
+                pass
 
     def run(self) -> dict[str, Any]:
         try:
@@ -357,6 +466,11 @@ class RealMEImageAttempt:
                 "dma": "deny-by-default bounded grant model",
                 "clock_reset_power": "isolated model available",
             },
+            "rom_services": {},
+            "rom_library": {
+                "status": "not-provided",
+                "path": str(self.rom_library_path) if self.rom_library_path else None,
+            },
             "execution": {
                 "instruction_execution_attempted": False,
                 "bytes_executed": 0,
@@ -418,13 +532,13 @@ class RealMEImageAttempt:
         ftpr = next((item for item in (me.get("fpt") or {}).get("partitions", []) if item.get("name") == "FTPR" and item.get("size")), None)
         cpd_result = cpd.get("cpd") or {}
         cpd_entries = cpd_result.get("entries", [])
-        if not me_region.get("offset") or not me_region.get("size"):
+        if me_region.get("offset") is None or not me_region.get("size"):
             report["execution"]["stop_reason"] = "Intel ME region was not identified"
             return report
         if ftpr is None:
             report["execution"]["stop_reason"] = "FTPR partition was not identified"
             return report
-        if cpd_result.get("signature") != "$CPD/":
+        if cpd_result.get("signature") not in {"$CPD/", "$CPD-"}:
             report["execution"]["stop_reason"] = "FTPR CPD directory was not identified"
             return report
 
@@ -446,6 +560,16 @@ class RealMEImageAttempt:
             image_size=len(image),
             module_sizes=module_sizes,
         ).as_dict()
+        self._trace(
+            {
+                "type": "preflight_complete",
+                "domain": "REAL FIRMWARE INSTRUCTION EXECUTION",
+                "synthetic_model": False,
+                "format": report["architecture"]["module_format"],
+                "module_count": len(report["module_plan"].get("modules", [])),
+                "compression_flags": report["architecture"]["compression_flags"],
+            }
+        )
 
         entry_point = (report["entry_metadata"] or {}).get("entry_point")
         if isinstance(entry_point, dict) and isinstance(entry_point.get("address"), int):
@@ -565,10 +689,51 @@ class RealMEImageAttempt:
                     runtime_config = RealRuntimeConfig()
                     if isinstance(runtime_layout, dict):
                         runtime_layout = dict(runtime_layout)
+                        rom_library_bytes: bytes | None = None
+                        if self.rom_library_path is not None:
+                            try:
+                                rom_library_bytes = self.rom_library_path.read_bytes()
+                            except OSError as exc:
+                                report["status"] = AttemptStatus.STOPPED_BEFORE_EXECUTION.value
+                                report["execution"]["stop_reason"] = (
+                                    f"STOP before instruction fetch: cannot read supplied ROM library: {exc}"
+                                )
+                                return report
+                            if not rom_library_bytes:
+                                report["status"] = AttemptStatus.STOPPED_BEFORE_EXECUTION.value
+                                report["execution"]["stop_reason"] = (
+                                    "STOP before instruction fetch: supplied ROM library is empty"
+                                )
+                                return report
+                            report["rom_library"] = {
+                                "status": "loaded",
+                                "path": str(self.rom_library_path),
+                                "base": "0x1000",
+                                "size": len(rom_library_bytes),
+                                "sha256": hashlib.sha256(rom_library_bytes).hexdigest(),
+                            }
                         evidence_global = _evidence_global_layout(loaded.data, entry_point)
                         if evidence_global is not None:
                             runtime_layout["evidence_global_base"] = evidence_global["base"]
                             runtime_layout["evidence_global_size"] = evidence_global["size"]
+                        rom_service = _rom_memset_evidence(
+                            loaded.data,
+                            code_base=int(entry_point["code_base"]),
+                            valid_extent=code_size,
+                        )
+                        if rom_service is not None:
+                            report["rom_services"] = {"memset": rom_service}
+                            self._trace(
+                                {
+                                    "type": "rom_service_admission",
+                                    "domain": "REAL FIRMWARE INSTRUCTION EXECUTION",
+                                    "synthetic_model": False,
+                                    "service": "memset",
+                                    "address": "0x103d",
+                                    "call_sites": rom_service["call_sites"],
+                                    "reason": rom_service["conclusion"],
+                                }
+                            )
                         runtime_config = RealRuntimeConfig(
                             stack_base=int(runtime_layout["stack_base"]),
                             stack_size=int(runtime_layout["stack_size"]),
@@ -583,12 +748,19 @@ class RealMEImageAttempt:
                                 else None
                             ),
                             evidence_global_size=int(runtime_layout.get("evidence_global_size", 0)),
+                            rom_memset_address=(
+                                int(rom_service["address"])
+                                if rom_service is not None and rom_library_bytes is None
+                                else None
+                            ),
+                            rom_library_bytes=rom_library_bytes,
                         )
                     runtime = RealUnicornRuntime(
                         image=image,
                         image_sha256=image_sha256,
                         trace_path=self.trace_path or self.image_path.with_suffix(".trace.jsonl"),
                         config=runtime_config,
+                        event_callback=self.event_callback,
                     )
                     result = runtime.run(loaded, int(entry_point.get("offset", 0)))
                     report["execution"].update(result)

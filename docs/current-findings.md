@@ -146,7 +146,9 @@ emulator: the real code stores `0x06041288` there, later uses it as a context
 pointer, and embeds `0x06047004`, exactly `0x7004` bytes above the base and
 equal to the metadata BSS size. Only that bounded window is mapped; the
 unmapped-write policy remains unchanged elsewhere. The real-image run advanced
-to 40 instructions / 106 instruction bytes and then reached an external fetch
-at `0x103d` from the call at `0x419bd`. The next blocker is the missing
-target-generation ME ROM/library implementation at that address. No synthetic
-stub or successful boot claim was added.
+to 56 instructions / 168 instruction bytes. The external ROM call at `0x103d`
+is now serviced only as the evidence-backed cdecl zero-fill ABI observed at
+ten real call sites. Execution then reaches the next distinct external fetch
+at `0x1005` from `0x417b1`; its 12-byte output structure and page-count use do
+not identify a safe return value without the target-generation ROM bytes. No
+synthetic stub or successful boot claim was added.

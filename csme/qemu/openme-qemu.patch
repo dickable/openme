@@ -1,0 +1,1012 @@
+diff --git a/hw/misc/meson.build b/hw/misc/meson.build
+index 8a94aba..83d94fc 100644
+--- a/hw/misc/meson.build
++++ b/hw/misc/meson.build
+@@ -6,6 +6,7 @@ system_ss.add(when: 'CONFIG_ISA_DEBUG', if_true: files('debugexit.c'))
+ system_ss.add(when: 'CONFIG_ISA_TESTDEV', if_true: files('pc-testdev.c'))
+ system_ss.add(when: 'CONFIG_PCI_TESTDEV', if_true: files('pci-testdev.c'))
+ system_ss.add(when: 'CONFIG_IOMMU_TESTDEV', if_true: files('iommu-testdev.c'))
++system_ss.add(files('openme-pci.c'))
+ system_ss.add(when: 'CONFIG_UNIMP', if_true: files('unimp.c'))
+ system_ss.add(when: 'CONFIG_EMPTY_SLOT', if_true: files('empty_slot.c'))
+ system_ss.add(when: 'CONFIG_LED', if_true: files('led.c'))
+diff --git a/hw/misc/openme-pci.c b/hw/misc/openme-pci.c
+new file mode 100644
+index 0000000..c9383f4
+--- /dev/null
++++ b/hw/misc/openme-pci.c
+@@ -0,0 +1,735 @@
++/*
++ * OpenME project-defined fake host-facing device.
++ *
++ * This is a deterministic research device for QEMU.  It is deliberately not
++ * an Intel device, does not load firmware, and does not implement Intel ME,
++ * CSME, HECI, AMT, Boot Guard, platform authentication, or any security
++ * mechanism.
++ *
++ * Copyright (C) 2026 The OpenME contributors
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation, either version 2 of the License, or (at your
++ * option) any later version.
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/bswap.h"
++#include "qemu/log.h"
++#include "qemu/module.h"
++#include "hw/pci/pci.h"
++#include "hw/pci/pci_device.h"
++#include "hw/core/qdev-properties.h"
++#include "qom/object.h"
++
++#define TYPE_OPENME_PCI "openme-me"
++OBJECT_DECLARE_SIMPLE_TYPE(OpenMEPCIState, OPENME_PCI)
++
++#define OPENME_VENDOR_ID 0x1234
++#define OPENME_DEVICE_ID 0x4d45
++#define OPENME_BAR_SIZE   0x1000
++#define OPENME_MAX_RESPONSES 8
++#define OPENME_MAX_PAYLOAD 256
++#define OPENME_FRAME_HEADER 16
++#define OPENME_MAX_FRAME (OPENME_FRAME_HEADER + OPENME_MAX_PAYLOAD)
++#define OPENME_FRAME_MAGIC 0x4f4d
++#define OPENME_FRAME_VERSION 1
++
++enum {
++    OPENME_REG_STATUS   = 0x00,
++    OPENME_REG_CONTROL  = 0x04,
++    OPENME_REG_VERSION  = 0x08,
++    OPENME_REG_EVENT    = 0x0c,
++    OPENME_REG_RX_LEN   = 0x10,
++    OPENME_REG_DOORBELL = 0x14,
++    OPENME_REG_TX_LEN   = 0x18,
++    OPENME_REG_TX_DATA  = 0x400,
++    OPENME_REG_RX_DATA  = 0x600,
++    OPENME_REG_RX_POP   = 0x220,
++    OPENME_REG_ERROR    = 0x228,
++    OPENME_REG_PLATFORM_STATE = 0x300,
++    OPENME_REG_PLATFORM_STATUS = 0x304,
++    OPENME_REG_PLATFORM_STEP = 0x308,
++    OPENME_REG_PLATFORM_EVENT = 0x30c,
++    OPENME_REG_SPI_SIZE = 0x310,
++    OPENME_REG_SPI_ADDRESS = 0x314,
++    OPENME_REG_SPI_DATA = 0x318,
++};
++
++enum {
++    OPENME_STATUS_READY     = 1 << 0,
++    OPENME_STATUS_IRQ       = 1 << 1,
++    OPENME_STATUS_SUSPENDED = 1 << 2,
++    OPENME_STATUS_ERROR     = 1 << 3,
++};
++
++enum {
++    OPENME_CONTROL_RESET = 1 << 0,
++    OPENME_CONTROL_ACK_IRQ = 1 << 1,
++    OPENME_CONTROL_CLEAR_ERROR = 1 << 2,
++};
++
++enum {
++    OPENME_CMD_RESET = 1,
++    OPENME_CMD_START,
++    OPENME_CMD_ENUMERATE,
++    OPENME_CMD_PROPERTIES,
++    OPENME_CMD_CONNECT,
++    OPENME_CMD_FLOW_CONTROL,
++    OPENME_CMD_DATA,
++    OPENME_CMD_DISCONNECT,
++    OPENME_CMD_SUSPEND,
++    OPENME_CMD_RESUME,
++};
++
++enum {
++    OPENME_FRAME_OK = 0x00,
++    OPENME_FRAME_BAD_MAGIC = 0x01,
++    OPENME_FRAME_BAD_VERSION = 0x02,
++    OPENME_FRAME_BAD_FLAGS = 0x03,
++    OPENME_FRAME_BAD_LENGTH = 0x04,
++    OPENME_FRAME_UNKNOWN_OPCODE = 0x05,
++    OPENME_FRAME_NOT_READY = 0x06,
++    OPENME_FRAME_INVALID_STATE = 0x07,
++    OPENME_FRAME_UNSUPPORTED = 0x0c,
++};
++
++enum {
++    OPENME_PLATFORM_RESET = 0,
++    OPENME_PLATFORM_ROM,
++    OPENME_PLATFORM_INIT,
++    OPENME_PLATFORM_SPI_READY,
++    OPENME_PLATFORM_MEI_READY,
++    OPENME_PLATFORM_AUTH_PENDING,
++    OPENME_PLATFORM_REJECTED,
++    OPENME_PLATFORM_RUNNING,
++    OPENME_PLATFORM_FAULT,
++};
++
++enum {
++    OPENME_PLATFORM_CLOCK_ON = 1 << 0,
++    OPENME_PLATFORM_POWER_ON = 1 << 1,
++    OPENME_PLATFORM_RESET_DEASSERTED = 1 << 2,
++    OPENME_PLATFORM_SPI_ONLINE = 1 << 3,
++    OPENME_PLATFORM_MEI_ONLINE = 1 << 4,
++    OPENME_PLATFORM_AUTH_REQUIRED = 1 << 5,
++};
++
++typedef struct OpenMEResponse {
++    uint32_t length;
++    uint8_t data[OPENME_MAX_FRAME];
++} OpenMEResponse;
++
++struct OpenMEPCIState {
++    PCIDevice parent_obj;
++    MemoryRegion mmio;
++
++    uint32_t event;
++    uint8_t response_count;
++    uint8_t response_head;
++    uint8_t response_tail;
++    OpenMEResponse responses[OPENME_MAX_RESPONSES];
++    uint32_t tx_length;
++    uint8_t tx_data[OPENME_MAX_FRAME];
++    bool ready;
++    bool suspended;
++    bool irq_pending;
++    bool error;
++    uint32_t platform_state;
++    uint32_t platform_status;
++    uint32_t platform_event;
++    uint32_t spi_address;
++    char *spi_image_path;
++    uint8_t *spi_image;
++    size_t spi_image_size;
++};
++
++static void openme_update_irq(OpenMEPCIState *s)
++{
++    pci_set_irq(&s->parent_obj, s->irq_pending ? 1 : 0);
++}
++
++static void openme_platform_update_status(OpenMEPCIState *s)
++{
++    s->platform_status = 0;
++    if (s->platform_state >= OPENME_PLATFORM_ROM) {
++        s->platform_status |= OPENME_PLATFORM_CLOCK_ON |
++                              OPENME_PLATFORM_POWER_ON;
++    }
++    if (s->platform_state >= OPENME_PLATFORM_INIT) {
++        s->platform_status |= OPENME_PLATFORM_RESET_DEASSERTED;
++    }
++    if (s->platform_state >= OPENME_PLATFORM_SPI_READY &&
++        s->platform_state <= OPENME_PLATFORM_RUNNING) {
++        s->platform_status |= OPENME_PLATFORM_SPI_ONLINE;
++    }
++    if (s->platform_state >= OPENME_PLATFORM_MEI_READY &&
++        s->platform_state <= OPENME_PLATFORM_RUNNING) {
++        s->platform_status |= OPENME_PLATFORM_MEI_ONLINE;
++    }
++    if (s->platform_state == OPENME_PLATFORM_AUTH_PENDING) {
++        s->platform_status |= OPENME_PLATFORM_AUTH_REQUIRED;
++    }
++}
++
++static void openme_platform_reset(OpenMEPCIState *s)
++{
++    s->platform_state = OPENME_PLATFORM_RESET;
++    s->platform_status = 0;
++    s->platform_event = 0;
++    s->spi_address = 0;
++    openme_platform_update_status(s);
++}
++
++static void openme_platform_step(OpenMEPCIState *s)
++{
++    switch (s->platform_state) {
++    case OPENME_PLATFORM_RESET:
++        s->platform_state = OPENME_PLATFORM_ROM;
++        break;
++    case OPENME_PLATFORM_ROM:
++        s->platform_state = OPENME_PLATFORM_INIT;
++        break;
++    case OPENME_PLATFORM_INIT:
++        s->platform_state = s->spi_image ? OPENME_PLATFORM_SPI_READY
++                                         : OPENME_PLATFORM_FAULT;
++        break;
++    case OPENME_PLATFORM_SPI_READY:
++        s->platform_state = OPENME_PLATFORM_MEI_READY;
++        break;
++    case OPENME_PLATFORM_MEI_READY:
++        s->platform_state = OPENME_PLATFORM_AUTH_PENDING;
++        break;
++    case OPENME_PLATFORM_AUTH_PENDING:
++        /* Never turn an unverified image into a running image. */
++        s->platform_state = OPENME_PLATFORM_REJECTED;
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "openme-me: platform stopped at authentication boundary\n");
++        break;
++    case OPENME_PLATFORM_REJECTED:
++    case OPENME_PLATFORM_RUNNING:
++    case OPENME_PLATFORM_FAULT:
++        break;
++    default:
++        s->platform_state = OPENME_PLATFORM_FAULT;
++        break;
++    }
++    s->platform_event++;
++    openme_platform_update_status(s);
++}
++
++static bool openme_load_spi_image(OpenMEPCIState *s, Error **errp)
++{
++    GError *error = NULL;
++    gsize length = 0;
++
++    if (!s->spi_image_path) {
++        return true;
++    }
++    if (!g_file_get_contents(s->spi_image_path, (gchar **)&s->spi_image,
++                             &length, &error)) {
++        error_setg(errp, "could not load OpenME SPI image '%s': %s",
++                   s->spi_image_path, error->message);
++        g_clear_error(&error);
++        return false;
++    }
++    s->spi_image_size = length;
++    return true;
++}
++
++static uint64_t openme_spi_read(OpenMEPCIState *s, unsigned size)
++{
++    uint64_t value = 0;
++    unsigned i;
++
++    if (!s->spi_image || s->spi_address >= s->spi_image_size ||
++        size > s->spi_image_size - s->spi_address || size > 4) {
++        return 0xff;
++    }
++    for (i = 0; i < size; i++) {
++        value |= (uint64_t)s->spi_image[s->spi_address + i] << (i * 8);
++    }
++    return value;
++}
++
++static void openme_reset_state(OpenMEPCIState *s)
++{
++    s->event = 0;
++    s->response_count = 0;
++    s->response_head = 0;
++    s->response_tail = 0;
++    memset(s->responses, 0, sizeof(s->responses));
++    s->tx_length = 0;
++    memset(s->tx_data, 0, sizeof(s->tx_data));
++    s->ready = false;
++    s->suspended = false;
++    s->irq_pending = false;
++    s->error = false;
++    openme_platform_reset(s);
++    openme_update_irq(s);
++}
++
++static void openme_set_error(OpenMEPCIState *s, const char *message)
++{
++    s->error = true;
++    qemu_log_mask(LOG_GUEST_ERROR, "openme-me: %s\n", message);
++}
++
++static void openme_queue_response(OpenMEPCIState *s, const uint8_t *data,
++                                  uint32_t length)
++{
++    OpenMEResponse *response;
++
++    if (length > OPENME_MAX_FRAME) {
++        openme_set_error(s, "response payload is too large");
++        return;
++    }
++    if (s->response_count == OPENME_MAX_RESPONSES) {
++        openme_set_error(s, "response queue is full");
++        return;
++    }
++
++    response = &s->responses[s->response_tail];
++    response->length = length;
++    memcpy(response->data, data, length);
++    s->response_tail = (s->response_tail + 1) % OPENME_MAX_RESPONSES;
++    s->response_count++;
++    s->irq_pending = true;
++    openme_update_irq(s);
++}
++
++static void openme_queue_status_response(OpenMEPCIState *s)
++{
++    static const uint8_t status_ok[4] = { 0, 0, 0, 0 };
++
++    openme_queue_response(s, status_ok, sizeof(status_ok));
++}
++
++static void openme_queue_frame(OpenMEPCIState *s, uint8_t opcode,
++                               uint32_t sequence, uint8_t status,
++                               const uint8_t *payload, uint16_t length)
++{
++    uint8_t frame[OPENME_MAX_FRAME];
++    uint8_t flags = 0x01 | (status ? 0x02 : 0x00);
++
++    if (length > OPENME_MAX_PAYLOAD) {
++        openme_set_error(s, "framed response payload is too large");
++        return;
++    }
++
++    stw_le_p(frame + 0, OPENME_FRAME_MAGIC);
++    frame[2] = OPENME_FRAME_VERSION;
++    frame[3] = flags;
++    frame[4] = opcode;
++    frame[5] = status;
++    stw_le_p(frame + 6, 0);
++    stl_le_p(frame + 8, sequence ? sequence : 1);
++    stw_le_p(frame + 12, length);
++    stw_le_p(frame + 14, 0);
++    if (length) {
++        memcpy(frame + OPENME_FRAME_HEADER, payload, length);
++    }
++    openme_queue_response(s, frame, OPENME_FRAME_HEADER + length);
++}
++
++static OpenMEResponse *openme_current_response(OpenMEPCIState *s)
++{
++    if (!s->response_count) {
++        return NULL;
++    }
++    return &s->responses[s->response_head];
++}
++
++static void openme_pop_response(OpenMEPCIState *s)
++{
++    if (!s->response_count) {
++        return;
++    }
++
++    s->response_head = (s->response_head + 1) % OPENME_MAX_RESPONSES;
++    s->response_count--;
++    if (!s->response_count) {
++        s->irq_pending = false;
++    }
++    openme_update_irq(s);
++}
++
++static bool openme_data_range(hwaddr addr, hwaddr base, unsigned size)
++{
++    return addr >= base && addr - base < OPENME_MAX_FRAME &&
++           size <= OPENME_MAX_FRAME - (addr - base);
++}
++
++static uint64_t openme_load_data(const uint8_t *data, hwaddr offset,
++                                 unsigned size)
++{
++    switch (size) {
++    case 1:
++        return ldub_p(data + offset);
++    case 2:
++        return lduw_le_p(data + offset);
++    case 4:
++        return ldl_le_p(data + offset);
++    default:
++        return 0;
++    }
++}
++
++static void openme_store_data(uint8_t *data, hwaddr offset, uint64_t value,
++                              unsigned size)
++{
++    switch (size) {
++    case 1:
++        stb_p(data + offset, value);
++        break;
++    case 2:
++        stw_le_p(data + offset, value);
++        break;
++    case 4:
++        stl_le_p(data + offset, value);
++        break;
++    default:
++        break;
++    }
++}
++
++static void openme_handle_framed_data(OpenMEPCIState *s)
++{
++    const uint8_t *data = s->tx_data;
++    uint16_t payload_length;
++    uint32_t sequence;
++    uint8_t opcode;
++    uint8_t status = OPENME_FRAME_OK;
++
++    if (s->tx_length < OPENME_FRAME_HEADER) {
++        openme_set_error(s, "framed request is shorter than the header");
++        return;
++    }
++
++    opcode = data[4];
++    sequence = ldl_le_p(data + 8);
++    payload_length = lduw_le_p(data + 12);
++
++    if (lduw_le_p(data + 0) != OPENME_FRAME_MAGIC) {
++        status = OPENME_FRAME_BAD_MAGIC;
++    } else if (data[2] != OPENME_FRAME_VERSION) {
++        status = OPENME_FRAME_BAD_VERSION;
++    } else if (data[3] != 0 || data[5] != 0) {
++        status = OPENME_FRAME_BAD_FLAGS;
++    } else if (lduw_le_p(data + 6) != 0 || lduw_le_p(data + 14) != 0 ||
++               sequence == 0 || payload_length > OPENME_MAX_PAYLOAD ||
++               s->tx_length != OPENME_FRAME_HEADER + payload_length) {
++        status = OPENME_FRAME_BAD_LENGTH;
++    }
++
++    if (status != OPENME_FRAME_OK) {
++        openme_queue_frame(s, opcode, sequence, status, NULL, 0);
++        return;
++    }
++
++    if (opcode < OPENME_CMD_RESET || opcode > OPENME_CMD_RESUME) {
++        openme_queue_frame(s, opcode, sequence,
++                           OPENME_FRAME_UNKNOWN_OPCODE, NULL, 0);
++        return;
++    }
++
++    if (opcode == OPENME_CMD_RESET) {
++        openme_reset_state(s);
++        openme_queue_frame(s, opcode, sequence, OPENME_FRAME_OK, NULL, 0);
++        return;
++    }
++
++    if (opcode == OPENME_CMD_START) {
++        s->ready = true;
++    } else if (!s->ready) {
++        openme_queue_frame(s, opcode, sequence, OPENME_FRAME_NOT_READY, NULL, 0);
++        return;
++    }
++
++    switch (opcode) {
++    case OPENME_CMD_DATA:
++        if (s->suspended) {
++            openme_queue_frame(s, opcode, sequence,
++                               OPENME_FRAME_INVALID_STATE, NULL, 0);
++            return;
++        }
++        s->event++;
++        openme_queue_frame(s, opcode, sequence, OPENME_FRAME_OK,
++                           data + OPENME_FRAME_HEADER, payload_length);
++        return;
++    case OPENME_CMD_SUSPEND:
++        s->suspended = true;
++        break;
++    case OPENME_CMD_RESUME:
++        s->suspended = false;
++        break;
++    case OPENME_CMD_START:
++        break;
++    default:
++        openme_queue_frame(s, opcode, sequence,
++                           OPENME_FRAME_UNSUPPORTED, NULL, 0);
++        return;
++    }
++
++    s->event++;
++    openme_queue_frame(s, opcode, sequence, OPENME_FRAME_OK, NULL, 0);
++}
++
++static void openme_handle_doorbell(OpenMEPCIState *s, uint32_t command)
++{
++    if (command == OPENME_CMD_RESET) {
++        openme_reset_state(s);
++        return;
++    }
++
++    if (command < OPENME_CMD_START || command > OPENME_CMD_RESUME) {
++        openme_set_error(s, "unsupported doorbell command");
++        return;
++    }
++
++    if (command == OPENME_CMD_START) {
++        s->ready = true;
++    } else if (!s->ready) {
++        openme_set_error(s, "command issued before START");
++        return;
++    }
++
++    if (command == OPENME_CMD_DATA && s->tx_length >= OPENME_FRAME_HEADER &&
++        lduw_le_p(s->tx_data) == OPENME_FRAME_MAGIC) {
++        openme_handle_framed_data(s);
++        return;
++    }
++
++    if (command == OPENME_CMD_DATA) {
++        if (s->suspended) {
++            openme_set_error(s, "DATA issued while suspended");
++            return;
++        }
++        if (s->tx_length > OPENME_MAX_PAYLOAD) {
++            openme_set_error(s, "raw DATA payload is too large");
++            return;
++        }
++        s->event++;
++        openme_queue_response(s, s->tx_data, s->tx_length);
++        return;
++    }
++
++    switch (command) {
++    case OPENME_CMD_SUSPEND:
++        s->suspended = true;
++        break;
++    case OPENME_CMD_RESUME:
++        s->suspended = false;
++        break;
++    default:
++        break;
++    }
++
++    s->event++;
++    openme_queue_status_response(s);
++}
++
++static uint64_t openme_mmio_read(void *opaque, hwaddr addr, unsigned size)
++{
++    OpenMEPCIState *s = opaque;
++
++    if (openme_data_range(addr, OPENME_REG_TX_DATA, size)) {
++        return openme_load_data(s->tx_data, addr - OPENME_REG_TX_DATA, size);
++    }
++
++    if (openme_data_range(addr, OPENME_REG_RX_DATA, size)) {
++        OpenMEResponse *response = openme_current_response(s);
++
++        return response ? openme_load_data(response->data,
++                                            addr - OPENME_REG_RX_DATA, size) : 0;
++    }
++
++    if (addr == OPENME_REG_SPI_DATA && (size == 1 || size == 2 || size == 4)) {
++        return openme_spi_read(s, size);
++    }
++
++    if (size != 4) {
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "openme-me: invalid MMIO read size %u\n", size);
++        return 0;
++    }
++
++    switch (addr) {
++    case OPENME_REG_STATUS:
++        return (s->ready ? OPENME_STATUS_READY : 0) |
++               (s->irq_pending ? OPENME_STATUS_IRQ : 0) |
++               (s->suspended ? OPENME_STATUS_SUSPENDED : 0);
++    case OPENME_REG_VERSION:
++        return 0x00010001;
++    case OPENME_REG_EVENT:
++        return s->event;
++    case OPENME_REG_RX_LEN:
++        return openme_current_response(s) ? openme_current_response(s)->length : 0;
++    case OPENME_REG_TX_LEN:
++        return s->tx_length;
++    case OPENME_REG_ERROR:
++        return s->error ? 1 : 0;
++    case OPENME_REG_PLATFORM_STATE:
++        return s->platform_state;
++    case OPENME_REG_PLATFORM_STATUS:
++        return s->platform_status;
++    case OPENME_REG_PLATFORM_EVENT:
++        return s->platform_event;
++    case OPENME_REG_SPI_SIZE:
++        return s->spi_image_size;
++    case OPENME_REG_SPI_ADDRESS:
++        return s->spi_address;
++    default:
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "openme-me: unsupported MMIO read at 0x%"HWADDR_PRIx"\n",
++                      addr);
++        return 0;
++    }
++}
++
++static void openme_mmio_write(void *opaque, hwaddr addr, uint64_t value,
++                              unsigned size)
++{
++    OpenMEPCIState *s = opaque;
++
++    if (openme_data_range(addr, OPENME_REG_TX_DATA, size)) {
++        openme_store_data(s->tx_data, addr - OPENME_REG_TX_DATA, value, size);
++        return;
++    }
++
++    if (size != 4) {
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "openme-me: invalid MMIO write size %u\n", size);
++        return;
++    }
++
++    switch (addr) {
++    case OPENME_REG_CONTROL:
++        if (value & OPENME_CONTROL_RESET) {
++            openme_reset_state(s);
++        }
++        if (value & OPENME_CONTROL_ACK_IRQ) {
++            s->irq_pending = false;
++            openme_update_irq(s);
++        }
++        if (value & OPENME_CONTROL_CLEAR_ERROR) {
++            s->error = false;
++        }
++        return;
++    case OPENME_REG_DOORBELL:
++        openme_handle_doorbell(s, value);
++        return;
++    case OPENME_REG_TX_LEN:
++        if (value > OPENME_MAX_FRAME) {
++            openme_set_error(s, "TX payload is too large");
++            s->tx_length = 0;
++        } else {
++            s->tx_length = value;
++        }
++        return;
++    case OPENME_REG_PLATFORM_STEP:
++        if (value != 1) {
++            openme_set_error(s, "platform step requires value 1");
++        } else {
++            openme_platform_step(s);
++        }
++        return;
++    case OPENME_REG_SPI_ADDRESS:
++        s->spi_address = value;
++        return;
++    case OPENME_REG_SPI_DATA:
++        openme_set_error(s, "SPI image is read-only");
++        return;
++    case OPENME_REG_RX_POP:
++        openme_pop_response(s);
++        return;
++    default:
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "openme-me: unsupported MMIO write at 0x%"HWADDR_PRIx"\n",
++                      addr);
++        return;
++    }
++}
++
++static const MemoryRegionOps openme_mmio_ops = {
++    .read = openme_mmio_read,
++    .write = openme_mmio_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = {
++        .min_access_size = 1,
++        .max_access_size = 4,
++        .unaligned = true,
++    },
++    .impl = {
++        .min_access_size = 1,
++        .max_access_size = 4,
++        .unaligned = true,
++    },
++};
++
++static void openme_pci_realize(PCIDevice *pci_dev, Error **errp)
++{
++    OpenMEPCIState *s = OPENME_PCI(pci_dev);
++
++    if (!openme_load_spi_image(s, errp)) {
++        return;
++    }
++    pci_dev->config[PCI_INTERRUPT_PIN] = 1;
++    memory_region_init_io(&s->mmio, OBJECT(s), &openme_mmio_ops, s,
++                          "openme-me-mmio", OPENME_BAR_SIZE);
++    pci_register_bar(pci_dev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->mmio);
++}
++
++static void openme_pci_unrealize(PCIDevice *pci_dev)
++{
++    OpenMEPCIState *s = OPENME_PCI(pci_dev);
++
++    g_free(s->spi_image);
++    s->spi_image = NULL;
++    s->spi_image_size = 0;
++}
++
++static const Property openme_pci_properties[] = {
++    DEFINE_PROP_STRING("spi-image", OpenMEPCIState, spi_image_path),
++};
++
++static void openme_pci_reset(DeviceState *dev)
++{
++    openme_reset_state(OPENME_PCI(dev));
++}
++
++static void openme_pci_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    PCIDeviceClass *pc = PCI_DEVICE_CLASS(klass);
++
++    pc->realize = openme_pci_realize;
++    pc->exit = openme_pci_unrealize;
++    pc->vendor_id = OPENME_VENDOR_ID;
++    pc->device_id = OPENME_DEVICE_ID;
++    pc->revision = 1;
++    pc->class_id = PCI_CLASS_OTHERS;
++    dc->desc = "OpenME project-defined fake host-facing device";
++    device_class_set_legacy_reset(dc, openme_pci_reset);
++    device_class_set_props(dc, openme_pci_properties);
++    set_bit(DEVICE_CATEGORY_MISC, dc->categories);
++}
++
++static const TypeInfo openme_pci_info = {
++    .name = TYPE_OPENME_PCI,
++    .parent = TYPE_PCI_DEVICE,
++    .instance_size = sizeof(OpenMEPCIState),
++    .class_init = openme_pci_class_init,
++    .interfaces = (const InterfaceInfo[]) {
++        { INTERFACE_CONVENTIONAL_PCI_DEVICE },
++        { },
++    },
++};
++
++static void openme_pci_register_types(void)
++{
++    type_register_static(&openme_pci_info);
++}
++
++type_init(openme_pci_register_types);
+diff --git a/tests/qtest/meson.build b/tests/qtest/meson.build
+index 019c63c..202a98a 100644
+--- a/tests/qtest/meson.build
++++ b/tests/qtest/meson.build
+@@ -57,6 +57,7 @@ qtests_filter = \
+   (get_option('default_devices') and host_os != 'windows' ? ['test-filter-redirector'] : [])
+ 
+ qtests_i386 = \
++  ['openme-pci-test'] + \
+   (slirp.found() ? ['pxe-test'] : []) + \
+   qtests_filter + \
+   (config_all_devices.has_key('CONFIG_ACPI_VMGENID') ? ['vmgenid-test'] : []) +             \
+diff --git a/tests/qtest/openme-pci-test.c b/tests/qtest/openme-pci-test.c
+new file mode 100644
+index 0000000..2d547d1
+--- /dev/null
++++ b/tests/qtest/openme-pci-test.c
+@@ -0,0 +1,241 @@
++/*
++ * QTest coverage for the OpenME project-defined fake PCI device.
++ *
++ * This test exercises only the local deterministic QEMU model.  It does not
++ * load firmware, access hardware, or claim compatibility with Intel ME.
++ */
++
++#include "qemu/osdep.h"
++#include "hw/pci/pci.h"
++#include "libqtest.h"
++#include "libqos/pci.h"
++#include "libqos/pci-pc.h"
++
++#define OPENME_VENDOR_ID 0x1234
++#define OPENME_DEVICE_ID 0x4d45
++
++#define OPENME_REG_STATUS   0x00
++#define OPENME_REG_CONTROL  0x04
++#define OPENME_REG_VERSION  0x08
++#define OPENME_REG_EVENT    0x0c
++#define OPENME_REG_RX_LEN   0x10
++#define OPENME_REG_DOORBELL 0x14
++#define OPENME_REG_TX_LEN   0x18
++#define OPENME_REG_TX_DATA  0x400
++#define OPENME_REG_RX_DATA  0x600
++#define OPENME_REG_RX_POP   0x220
++#define OPENME_REG_PLATFORM_STATE 0x300
++#define OPENME_REG_PLATFORM_STATUS 0x304
++#define OPENME_REG_PLATFORM_STEP 0x308
++#define OPENME_REG_PLATFORM_EVENT 0x30c
++#define OPENME_REG_SPI_SIZE 0x310
++
++#define OPENME_STATUS_READY     (1 << 0)
++#define OPENME_STATUS_IRQ       (1 << 1)
++#define OPENME_STATUS_SUSPENDED (1 << 2)
++
++#define OPENME_CONTROL_RESET   (1 << 0)
++#define OPENME_CONTROL_ACK_IRQ (1 << 1)
++
++#define OPENME_CMD_START   2
++#define OPENME_CMD_DATA    7
++#define OPENME_CMD_SUSPEND 9
++
++#define OPENME_FRAME_HEADER 16
++#define OPENME_FRAME_MAGIC 0x4f4d
++
++#define OPENME_PLATFORM_RESET 0
++#define OPENME_PLATFORM_ROM 1
++#define OPENME_PLATFORM_INIT 2
++#define OPENME_PLATFORM_FAULT 8
++#define OPENME_PLATFORM_RESET_DEASSERTED (1 << 2)
++
++static QPCIDevice *openme_find_device(QPCIBus *bus)
++{
++    int devfn;
++
++    for (devfn = 0; devfn < 256; devfn++) {
++        QPCIDevice *candidate = qpci_device_find(bus, devfn);
++        uint32_t id;
++
++        if (!candidate) {
++            continue;
++        }
++
++        id = qpci_config_readl(candidate, PCI_VENDOR_ID);
++        if (id == ((OPENME_DEVICE_ID << 16) | OPENME_VENDOR_ID)) {
++            return candidate;
++        }
++        g_free(candidate);
++    }
++
++    return NULL;
++}
++
++static void test_openme_mmio_contract(void)
++{
++    QTestState *qts;
++    QPCIBus *bus;
++    QPCIDevice *dev;
++    QPCIBar bar;
++
++    qts = qtest_init("-machine q35 -nodefaults -display none "
++                     "-device openme-me,addr=01.0");
++    bus = qpci_new_pc(qts, NULL);
++    dev = openme_find_device(bus);
++    g_assert_nonnull(dev);
++
++    g_assert_cmphex(qpci_config_readl(dev, PCI_VENDOR_ID), ==,
++                    (OPENME_DEVICE_ID << 16) | OPENME_VENDOR_ID);
++
++    qpci_device_enable(dev);
++    bar = qpci_iomap(dev, 0, NULL);
++
++    g_assert_cmphex(qpci_io_readl(dev, bar, OPENME_REG_VERSION), ==,
++                    0x00010001);
++    g_assert_cmphex(qpci_io_readl(dev, bar, OPENME_REG_STATUS), ==, 0);
++    g_assert_cmphex(qpci_io_readl(dev, bar, OPENME_REG_EVENT), ==, 0);
++    g_assert_cmphex(qpci_io_readl(dev, bar, OPENME_REG_RX_LEN), ==, 0);
++
++    /* The platform scaffold must stop cleanly when no SPI image is attached. */
++    g_assert_cmphex(qpci_io_readl(dev, bar, OPENME_REG_PLATFORM_STATE), ==,
++                    OPENME_PLATFORM_RESET);
++    g_assert_cmphex(qpci_io_readl(dev, bar, OPENME_REG_SPI_SIZE), ==, 0);
++    qpci_io_writel(dev, bar, OPENME_REG_PLATFORM_STEP, 1);
++    g_assert_cmphex(qpci_io_readl(dev, bar, OPENME_REG_PLATFORM_STATE), ==,
++                    OPENME_PLATFORM_ROM);
++    qpci_io_writel(dev, bar, OPENME_REG_PLATFORM_STEP, 1);
++    g_assert_cmphex(qpci_io_readl(dev, bar, OPENME_REG_PLATFORM_STATE), ==,
++                    OPENME_PLATFORM_INIT);
++    qpci_io_writel(dev, bar, OPENME_REG_PLATFORM_STEP, 1);
++    g_assert_cmphex(qpci_io_readl(dev, bar, OPENME_REG_PLATFORM_STATE), ==,
++                    OPENME_PLATFORM_FAULT);
++    g_assert_cmphex(qpci_io_readl(dev, bar, OPENME_REG_PLATFORM_STATUS), ==,
++                    OPENME_PLATFORM_RESET_DEASSERTED |
++                    (1 << 0) | (1 << 1));
++    g_assert_cmphex(qpci_io_readl(dev, bar, OPENME_REG_PLATFORM_EVENT), ==, 3);
++
++    qpci_io_writel(dev, bar, OPENME_REG_DOORBELL, OPENME_CMD_START);
++    g_assert_cmphex(qpci_io_readl(dev, bar, OPENME_REG_STATUS), ==,
++                    OPENME_STATUS_READY | OPENME_STATUS_IRQ);
++    g_assert_cmphex(qpci_io_readl(dev, bar, OPENME_REG_EVENT), ==, 1);
++    g_assert_cmphex(qpci_io_readl(dev, bar, OPENME_REG_RX_LEN), ==, 4);
++
++    qpci_io_writel(dev, bar, OPENME_REG_CONTROL, OPENME_CONTROL_ACK_IRQ);
++    g_assert_cmphex(qpci_io_readl(dev, bar, OPENME_REG_STATUS), ==,
++                    OPENME_STATUS_READY);
++
++    qpci_io_writel(dev, bar, OPENME_REG_TX_LEN, 5);
++    qpci_io_writeb(dev, bar, OPENME_REG_TX_DATA + 0, 'h');
++    qpci_io_writeb(dev, bar, OPENME_REG_TX_DATA + 1, 'e');
++    qpci_io_writeb(dev, bar, OPENME_REG_TX_DATA + 2, 'l');
++    qpci_io_writeb(dev, bar, OPENME_REG_TX_DATA + 3, 'l');
++    qpci_io_writeb(dev, bar, OPENME_REG_TX_DATA + 4, 'o');
++    qpci_io_writel(dev, bar, OPENME_REG_DOORBELL, OPENME_CMD_DATA);
++    g_assert_cmphex(qpci_io_readl(dev, bar, OPENME_REG_EVENT), ==, 2);
++
++    /* Remove START's status response before reading the echo payload. */
++    qpci_io_writel(dev, bar, OPENME_REG_RX_POP, 1);
++    g_assert_cmphex(qpci_io_readl(dev, bar, OPENME_REG_RX_LEN), ==, 5);
++    g_assert_cmpint(qpci_io_readb(dev, bar, OPENME_REG_RX_DATA + 0), ==, 'h');
++    g_assert_cmpint(qpci_io_readb(dev, bar, OPENME_REG_RX_DATA + 1), ==, 'e');
++    g_assert_cmpint(qpci_io_readb(dev, bar, OPENME_REG_RX_DATA + 2), ==, 'l');
++    g_assert_cmpint(qpci_io_readb(dev, bar, OPENME_REG_RX_DATA + 3), ==, 'l');
++    g_assert_cmpint(qpci_io_readb(dev, bar, OPENME_REG_RX_DATA + 4), ==, 'o');
++    qpci_io_writel(dev, bar, OPENME_REG_RX_POP, 1);
++    g_assert_cmphex(qpci_io_readl(dev, bar, OPENME_REG_RX_LEN), ==, 0);
++
++    qpci_io_writel(dev, bar, OPENME_REG_DOORBELL, OPENME_CMD_SUSPEND);
++    g_assert_cmphex(qpci_io_readl(dev, bar, OPENME_REG_STATUS), ==,
++                    OPENME_STATUS_READY | OPENME_STATUS_IRQ |
++                    OPENME_STATUS_SUSPENDED);
++    g_assert_cmphex(qpci_io_readl(dev, bar, OPENME_REG_EVENT), ==, 3);
++
++    qpci_io_writel(dev, bar, OPENME_REG_CONTROL, OPENME_CONTROL_RESET);
++    g_assert_cmphex(qpci_io_readl(dev, bar, OPENME_REG_STATUS), ==, 0);
++    g_assert_cmphex(qpci_io_readl(dev, bar, OPENME_REG_EVENT), ==, 0);
++    g_assert_cmphex(qpci_io_readl(dev, bar, OPENME_REG_RX_LEN), ==, 0);
++
++    /* The native adapter also accepts one complete project-defined frame. */
++    {
++        const uint8_t payload[] = "hello-openme";
++        uint8_t frame[OPENME_FRAME_HEADER + sizeof(payload) - 1];
++        size_t i;
++
++        memset(frame, 0, sizeof(frame));
++        frame[0] = OPENME_FRAME_MAGIC & 0xff;
++        frame[1] = OPENME_FRAME_MAGIC >> 8;
++        frame[2] = 1;
++        frame[4] = OPENME_CMD_DATA;
++        frame[8] = 7;
++        frame[12] = sizeof(payload) - 1;
++        memcpy(frame + OPENME_FRAME_HEADER, payload, sizeof(payload) - 1);
++
++        qpci_io_writel(dev, bar, OPENME_REG_DOORBELL, OPENME_CMD_START);
++        qpci_io_writel(dev, bar, OPENME_REG_RX_POP, 1);
++        qpci_io_writel(dev, bar, OPENME_REG_TX_LEN, sizeof(frame));
++        for (i = 0; i < sizeof(frame); i++) {
++            qpci_io_writeb(dev, bar, OPENME_REG_TX_DATA + i, frame[i]);
++        }
++        qpci_io_writel(dev, bar, OPENME_REG_DOORBELL, OPENME_CMD_DATA);
++        g_assert_cmphex(qpci_io_readl(dev, bar, OPENME_REG_RX_LEN), ==,
++                        sizeof(frame));
++        g_assert_cmpint(qpci_io_readb(dev, bar, OPENME_REG_RX_DATA + 0), ==,
++                        'M');
++        g_assert_cmpint(qpci_io_readb(dev, bar, OPENME_REG_RX_DATA + 1), ==,
++                        'O');
++        g_assert_cmpint(qpci_io_readb(dev, bar, OPENME_REG_RX_DATA + 3), ==,
++                        1);
++        g_assert_cmpint(qpci_io_readb(dev, bar, OPENME_REG_RX_DATA + 4), ==,
++                        OPENME_CMD_DATA);
++        g_assert_cmpint(qpci_io_readb(dev, bar, OPENME_REG_RX_DATA + 5), ==,
++                        0);
++        g_assert_cmpint(qpci_io_readb(dev, bar,
++                                     OPENME_REG_RX_DATA + OPENME_FRAME_HEADER),
++                        ==, 'h');
++        qpci_io_writel(dev, bar, OPENME_REG_RX_POP, 1);
++    }
++
++    /* Full 272-byte frames must not alias either buffer or control registers. */
++    {
++        uint8_t frame[OPENME_FRAME_HEADER + 256] = { 0 };
++        size_t i;
++
++        frame[0] = OPENME_FRAME_MAGIC & 0xff;
++        frame[1] = OPENME_FRAME_MAGIC >> 8;
++        frame[2] = 1;
++        frame[4] = OPENME_CMD_DATA;
++        frame[8] = 8;
++        frame[13] = 1; /* 256-byte payload, little endian. */
++        for (i = OPENME_FRAME_HEADER; i < sizeof(frame); i++) {
++            frame[i] = i - OPENME_FRAME_HEADER;
++        }
++        qpci_io_writel(dev, bar, OPENME_REG_TX_LEN, sizeof(frame));
++        for (i = 0; i < sizeof(frame); i++) {
++            qpci_io_writeb(dev, bar, OPENME_REG_TX_DATA + i, frame[i]);
++            g_assert_cmpint(qpci_io_readb(dev, bar, OPENME_REG_TX_DATA + i), ==, frame[i]);
++        }
++        qpci_io_writel(dev, bar, OPENME_REG_DOORBELL, OPENME_CMD_DATA);
++        frame[3] = 1; /* response flag */
++        g_assert_cmphex(qpci_io_readl(dev, bar, OPENME_REG_RX_LEN), ==, sizeof(frame));
++        for (i = 0; i < sizeof(frame); i++) {
++            g_assert_cmpint(qpci_io_readb(dev, bar, OPENME_REG_RX_DATA + i), ==, frame[i]);
++        }
++        g_assert_cmphex(qpci_io_readw(dev, bar, OPENME_REG_RX_DATA + sizeof(frame) - 2), ==, 0xfffe);
++        g_assert_cmphex(qpci_io_readl(dev, bar, OPENME_REG_RX_DATA + sizeof(frame) - 4), ==, 0xfffefdfc);
++        qpci_io_writel(dev, bar, OPENME_REG_RX_POP, 1);
++        g_assert_cmphex(qpci_io_readl(dev, bar, OPENME_REG_RX_LEN), ==, 0);
++    }
++
++    qpci_iounmap(dev, bar);
++    g_free(dev);
++    qpci_free_pc(bus);
++    qtest_quit(qts);
++}
++
++int main(int argc, char **argv)
++{
++    g_test_init(&argc, &argv, NULL);
++    g_test_add_func("/openme/mmio-contract", test_openme_mmio_contract);
++    return g_test_run();
++}

@@ -88,9 +88,15 @@ def _decode_builtin(data: bytes, offset: int, base: int) -> dict[str, Any]:
 
     one_byte = {
         0x55: "push ebp", 0x56: "push esi", 0x53: "push ebx",
+        0x50: "push eax", 0x57: "push edi",
         0x5D: "pop ebp", 0x5E: "pop esi", 0x58: "pop eax",
         0x90: "nop", 0xC3: "ret",
     }
+    if remaining[0] == 0x6A and len(remaining) >= 2:
+        return record(2, f"push {_signed8(remaining[1])}", immediate=_signed8(remaining[1]))
+    if remaining[0] == 0x68 and len(remaining) >= 5:
+        value = _u32(data, offset + 1)
+        return record(5, f"push {_hex(value)}", immediate=value)
     if remaining[0] in one_byte:
         return record(1, one_byte[remaining[0]])
     if len(remaining) >= 2 and remaining[:2] == b"\x89\xe5":
@@ -113,16 +119,22 @@ def _decode_builtin(data: bytes, offset: int, base: int) -> dict[str, Any]:
         return record(2, f"{mnemonic} {_hex(target)}", target=target, control_flow="branch")
     if remaining[0] == 0x83 and len(remaining) >= 3:
         modrm, immediate = remaining[1], _signed8(remaining[2])
-        if modrm in (0xC0, 0xC2):
-            register = "eax" if modrm == 0xC0 else "edx"
-            return record(3, f"add {register},{immediate}", immediate=immediate, reads=[register.upper()], writes=[register.upper()])
+        register_ops = {
+            0xC0: ("add", "eax"), 0xC2: ("add", "edx"),
+            0xC4: ("add", "esp"), 0xEC: ("sub", "esp"),
+        }
+        if modrm in register_ops:
+            mnemonic, register = register_ops[modrm]
+            return record(3, f"{mnemonic} {register},{immediate}", immediate=immediate, reads=[register.upper()], writes=[register.upper()])
     if remaining[0] in (0x8B, 0x89) and len(remaining) >= 3:
         modrm, displacement = remaining[1], _signed8(remaining[2])
         memory_forms = {
             (0x8B, 0x75): ("esi", "ebp"),
             (0x8B, 0x5D): ("ebx", "ebp"),
+            (0x8B, 0x45): ("eax", "ebp"),
             (0x8B, 0x4A): ("ecx", "edx"),
             (0x89, 0x48): ("ecx", "eax"),
+            (0x89, 0x45): ("eax", "ebp"),
         }
         form = memory_forms.get((remaining[0], modrm))
         if form:
@@ -133,6 +145,28 @@ def _decode_builtin(data: bytes, offset: int, base: int) -> dict[str, Any]:
             if remaining[0] == 0x8B:
                 return record(3, f"mov {register},dword ptr {memory}", reads=[memory], writes=[register.upper()], displacement=displacement)
             return record(3, f"mov dword ptr {memory},{register}", reads=[register.upper()], writes=[memory], displacement=displacement)
+    if remaining[0] == 0x8D and len(remaining) >= 3 and remaining[1] == 0x45:
+        displacement = _signed8(remaining[2])
+        sign = "+" if displacement >= 0 else "-"
+        memory = f"[ebp{sign}{_hex(abs(displacement))}]" if displacement else "[ebp]"
+        return record(3, f"lea eax,{memory}", reads=[memory], writes=["EAX"], displacement=displacement)
+    if remaining[0] == 0xA1 and len(remaining) >= 5:
+        address_value = _u32(data, offset + 1)
+        return record(5, f"mov eax,dword ptr [{_hex(address_value)}]", reads=[_hex(address_value)], writes=["EAX"], absolute_address=address_value)
+    if remaining[0] == 0x8B and len(remaining) >= 6 and remaining[1] == 0x1D:
+        address_value = _u32(data, offset + 2)
+        return record(6, f"mov ebx,dword ptr [{_hex(address_value)}]", reads=[_hex(address_value)], writes=["EBX"], absolute_address=address_value)
+    if remaining[0] == 0xFF and len(remaining) >= 6 and remaining[1] == 0x35:
+        address_value = _u32(data, offset + 2)
+        return record(6, f"push dword ptr [{_hex(address_value)}]", reads=[_hex(address_value)], absolute_address=address_value)
+    if remaining[0] == 0x66 and len(remaining) >= 9 and remaining[1:3] == b"\xc7\x80":
+        displacement = _u32(data, offset + 3)
+        value = int.from_bytes(remaining[7:9], "little")
+        return record(9, f"mov word ptr [eax+{_hex(displacement)}],{_hex(value)}", immediate=value, displacement=displacement)
+    if remaining[0] == 0xC7 and len(remaining) >= 10 and remaining[1] == 0x83:
+        displacement = _u32(data, offset + 2)
+        value = _u32(data, offset + 6)
+        return record(10, f"mov dword ptr [ebx+{_hex(displacement)}],{_hex(value)}", immediate=value, writes=["[EBX+" + _hex(displacement) + "]"], displacement=displacement)
 
     return record(1, f".byte 0x{remaining[0]:02x}")
 
@@ -508,25 +542,36 @@ def analyze_real_rbe(
             "start": int(evidence_global["base"]),
             "end": int(evidence_global["end"]),
         })
-    target_values = (0x06040000, 0x06041288)
+    target = int(evidence_global["base"]) if evidence_global is not None else 0x06040000
+    pointer = int(evidence_global["pointer"]) if evidence_global is not None else None
+    target_values = (target,) + ((pointer,) if pointer is not None else ())
     refs = { _hex(target): _reference_records(loaded.data, DEFAULT_MODULE_BASE, target, reference_window, ranges) for target in target_values }
     caller = _caller_data_flow(loaded.data, DEFAULT_MODULE_BASE, caller_address, entry, caller_window)
     analysis_root = Path(__file__).resolve().parents[2]
-    target = 0x06040000
-    source = 0x43000
-    source_offset = source - DEFAULT_MODULE_BASE
+    source = int(evidence_global["source_address"]) if evidence_global is not None else None
+    source_offset = source - DEFAULT_MODULE_BASE if source is not None else None
+    if evidence_global is not None:
+        target_status = "evidence_derived_global_bss_window"
+        target_evidence = [
+            f"the bounded rbe startup copy loop derives global base {_hex(target)}",
+            f"the source word at {_hex(source)} contains pointer {_hex(pointer)}",
+            f"the pointer is inside the metadata BSS window {_hex(target)}-{_hex(evidence_global['end'])}",
+            f"the metadata BSS size is {_hex(evidence_global['size'])}",
+        ]
+        emulator_action = (
+            f"map only the evidence-derived writable window {_hex(target)}-{_hex(evidence_global['end'])}; "
+            "keep the default hard-stop policy for all other unmapped addresses"
+        )
+    else:
+        target_status = "unresolved"
+        target_evidence = [
+            "no bounded rbe startup copy loop, pointer source, and metadata BSS correlation were established",
+        ]
+        emulator_action = "keep the target unmapped and stop on access"
     target_classification = {
-        "status": "evidence_derived_global_bss_window",
+        "status": target_status,
         "address": _hex(target),
-        "evidence": [
-            "the real decoded module contains the immediate 0x06040000 at 0x40001",
-            "the first executed store is a 4-byte write to 0x06040000, with value 0x06041288",
-            "the module embeds 0x06047004, exactly 0x7004 bytes above 0x06040000",
-            "0x7004 is the rbe process BSS size from extension 0x05",
-            "the pointer 0x06041288 is inside that bounded 0x06040000-0x06047004 window",
-            "rbe metadata exposes extension tags 0x05 and 0x06, not the meloader MMIO-range extension tag 0x08",
-            "the public meloader config records hmbound, ecbase, and rombase but does not define 0x06040000",
-        ],
+        "evidence": target_evidence,
         "not_supported": [
             "ROM/library address",
             "MMIO register",
@@ -536,16 +581,16 @@ def analyze_real_rbe(
             "target-generation ME ROM/library or authoritative hardware memory-map evidence; the BSS classification is established for this emulation attempt, not physical hardware",
             "the ROM/library implementation at the next external call target, 0x103d, which is outside the bounded syslib image",
         ],
-        "emulator_action": "map only the evidence-derived writable window 0x06040000-0x06047004; keep the default hard-stop policy for all other unmapped addresses",
+        "emulator_action": emulator_action,
     }
     source_origin = {
         "load_address": _hex(source),
-        "module_offset": _hex(source_offset),
+        "module_offset": _hex(source_offset) if source_offset is not None else None,
         "decoded_capacity": _hex(len(loaded.data)),
         "valid_code_extent": _hex(valid_extent) if valid_extent is not None else None,
-        "location": "rodata/capacity tail: outside valid code extent, inside decoded capacity" if valid_extent is not None and valid_extent <= source_offset < len(loaded.data) else "not established",
-        "value": _hex(_u32(loaded.data, source_offset)) if 0 <= source_offset <= len(loaded.data) - 4 else None,
-        "use": "the callee loads dword [0x43000] into ECX and stores it to 0x06040000",
+        "location": "rodata/capacity tail: outside valid code extent, inside decoded capacity" if source_offset is not None and valid_extent is not None and valid_extent <= source_offset < len(loaded.data) else "not established",
+        "value": _hex(_u32(loaded.data, source_offset)) if source_offset is not None and 0 <= source_offset <= len(loaded.data) - 4 else None,
+        "use": f"the callee loads dword [{_hex(source)}] into ECX and stores it to {_hex(target)}" if source is not None else "not established",
     }
     rbe_metadata = next(
         (

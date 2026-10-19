@@ -21,6 +21,7 @@ except ImportError:  # pragma: no cover - supports direct script execution
     from inspect_me import inspect_me
 
 CPD_SIGNATURE = b"$CPD/"
+CPD_SIGNATURES = (b"$CPD/", b"$CPD-")
 CPD_FIRST_ENTRY_OFFSET = 0x0C
 CPD_MANIFEST_NAME_SIZE = 12
 CPD_ENTRY_NAME_SIZE = 12
@@ -59,12 +60,18 @@ def parse_cpd_directory(data: bytes) -> dict:
             "are reported without assigning undocumented semantic meaning."
         ),
     }
-    signature_offset = data.find(CPD_SIGNATURE, 0, min(len(data), 0x1000))
-    if signature_offset < 0:
-        result["warnings"].append("$CPD/ signature not found in the first 4 KiB")
+    signature = None
+    signature_offset = -1
+    for candidate in CPD_SIGNATURES:
+        offset = data.find(candidate, 0, min(len(data), 0x1000))
+        if offset >= 0 and (signature_offset < 0 or offset < signature_offset):
+            signature = candidate
+            signature_offset = offset
+    if signature is None:
+        result["warnings"].append("$CPD/ or $CPD- signature not found in the first 4 KiB")
         return result
 
-    result["signature"] = CPD_SIGNATURE.decode("ascii")
+    result["signature"] = signature.decode("ascii")
     result["signature_offset"] = signature_offset
     position = signature_offset + CPD_FIRST_ENTRY_OFFSET
 

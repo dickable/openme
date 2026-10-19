@@ -36,6 +36,18 @@ class InspectCpdTests(unittest.TestCase):
         self.assertEqual(result["entries"], [])
         self.assertTrue(result["warnings"])
 
+    def test_legacy_hyphen_signature_is_reported(self):
+        image = bytearray(0x100)
+        image[:5] = b"$CPD-"
+        first = 0x0C
+        image[first:first + 12] = b"FTPRFTPR.man"
+        struct.pack_into("<III", image, first + 12, 0, 0x28, 0x1234)
+
+        result = parse_cpd_directory(bytes(image))
+        self.assertEqual(result["signature"], "$CPD-")
+        self.assertEqual(result["entry_count"], 1)
+        self.assertEqual(result["entries"][0]["name"], "FTPRFTPR.man")
+
 
 if __name__ == "__main__":
     unittest.main()

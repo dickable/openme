@@ -44,19 +44,44 @@ class RealRBEAnalysisTests(unittest.TestCase):
 
     def test_global_window_requires_pointer_end_and_metadata_bss_correlation(self):
         module = bytearray(0x4000)
+        module[0:0x24] = bytes.fromhex(
+            "55b80000040689e5ba003004003d04000406730e83c20483c0048b4afc8948fc"
+            "ebeb5dc3"
+        )
         module[0x3000:0x3004] = (0x06041288).to_bytes(4, "little")
-        module[0x10:0x14] = (0x06040000).to_bytes(4, "little")
-        module[0x14:0x18] = (0x06047004).to_bytes(4, "little")
+        module[0x2000:0x2004] = (0x06047004).to_bytes(4, "little")
         entry = {
             "module": "rbe",
+            "code_base": 0x40000,
             "code_size": 0x29C6,
             "runtime_layout": {"bss_size": 0x7004},
         }
         layout = _evidence_global_layout(bytes(module), entry)
         self.assertEqual(layout["base"], 0x06040000)
         self.assertEqual(layout["end"], 0x06047004)
-        module[0x14:0x18] = b"\0\0\0\0"
+        module[0x2000:0x2004] = b"\0\0\0\0"
         self.assertIsNone(_evidence_global_layout(bytes(module), entry))
+
+    def test_global_window_derives_variant_pointer_source(self):
+        module = bytearray(0x5000)
+        module[0:0x24] = bytes.fromhex(
+            "55b80000040689e5ba004004003d04000406730e83c20483c0048b4afc8948fc"
+            "ebeb5dc3"
+        )
+        module[0x4000:0x4004] = (0x06041280).to_bytes(4, "little")
+        module[0x2400:0x2404] = (0x06047004).to_bytes(4, "little")
+        entry = {
+            "module": "rbe",
+            "code_base": 0x40000,
+            "code_size": 0x2F01,
+            "runtime_layout": {"bss_size": 0x7004},
+        }
+
+        layout = _evidence_global_layout(bytes(module), entry)
+
+        self.assertEqual(layout["base"], 0x06040000)
+        self.assertEqual(layout["pointer"], 0x06041280)
+        self.assertEqual(layout["source_address"], 0x44000)
 
 
 if __name__ == "__main__":

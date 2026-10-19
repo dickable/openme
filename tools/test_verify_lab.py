@@ -19,6 +19,21 @@ class VerifyLabTests(unittest.TestCase):
             )
         self.assertTrue(any(check.name == "synthetic.qemu_contract" for check in report.checks))
 
+    def test_imported_contract_modules_actually_run_checks(self):
+        report = verify_lab.run_verification()
+        check = next(c for c in report.checks if c.name == "synthetic.qemu_contract")
+        self.assertEqual(check.status, "PASS", check.detail)
+        self.assertEqual(report.contract_version, "framed-v1")
+
+    def test_missing_contract_module_still_fails(self):
+        verify_lab._prepare_qemu_model_imports()
+        modules, checks = verify_lab._load_modules(verify_lab.UNICORN_MODULES + verify_lab.QEMU_CONTRACT_MODULES)
+        del modules["qemu_lab_contract"]
+        with mock.patch.object(verify_lab, "_load_modules", return_value=(modules, checks)):
+            report = verify_lab.run_verification()
+        self.assertFalse(report.passed)
+        self.assertEqual(report.contract_version, "unavailable")
+
     def test_unicorn_unavailable_fails_with_actionable_message(self):
         verify_lab._prepare_qemu_model_imports()
         runtime_module = __import__("csme.cpu.unicorn_runtime", fromlist=["*"])

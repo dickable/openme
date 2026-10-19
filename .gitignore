@@ -7,3 +7,6 @@ downloaded-firmware/
 working-copies/
 qemu-work/
 
+# Physical chip backups, staged images, and hardware-session logs.
+hardware-sessions/
+

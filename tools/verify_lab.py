@@ -240,7 +240,7 @@ def run_verification() -> VerificationReport:
         checks.extend(_run_unicorn_checks(runtime_module, bridge_module))
         unicorn_version = _unicorn_version()
 
-    if all(name in modules for name in QEMU_CONTRACT_MODULES):
+    if all(name.rsplit(".", 1)[-1] in modules for name in QEMU_CONTRACT_MODULES):
         checks.append(_run_qemu_contract_check(modules))
         contract_version = f"framed-v{modules['framed_transport'].VERSION}"
     else:

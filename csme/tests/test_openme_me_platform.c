@@ -29,6 +29,17 @@ int main(void)
     assert(platform->state == OPENME_ME_REJECTED);
     assert(strcmp(openme_me_platform_rejection(platform),
                   "firmware authentication/runtime loader not implemented") == 0);
+    /* FAULT sorts after RUNNING but must not advertise online peripherals. */
+    openme_me_platform_init(platform, NULL, 0);
+    for (unsigned int i = 0; i < 3; ++i) {
+        openme_me_platform_step(platform);
+    }
+    assert(platform->state == OPENME_ME_FAULT);
+    assert(openme_me_platform_read(platform, OPENME_ME_PCH_BASE + OPENME_ME_PCH_STATUS,
+                                   value, sizeof(value)) == 0);
+    assert(value[0] == (OPENME_ME_CLOCK_ON | OPENME_ME_POWER_ON | OPENME_ME_RESET_DEASSERTED));
+    assert(openme_me_platform_read(platform, OPENME_ME_MEI_BASE, value, sizeof(value)) == 0);
+    assert(value[0] == 0);
     free(platform);
     return 0;
 }
